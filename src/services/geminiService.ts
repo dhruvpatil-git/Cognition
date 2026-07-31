@@ -1,3 +1,4 @@
+import { GoogleGenAI } from '@google/genai';
 import { SYSTEM_PROMPT } from '../constants/systemPrompt';
 import type { Allocation, PortfolioAnalytics } from '../types/risk';
 
@@ -35,6 +36,7 @@ export function saveGeminiApiKey(key: string): void {
 
 /**
  * Calls Google Gemini API using systemPrompt.ts instructions and active portfolio context.
+ * Supports all key formats provided by Google Cloud / AI Studio (AIzaSy..., AQ..., etc.).
  */
 export async function askGeminiRiskAssistant(
   userQuery: string,
@@ -83,16 +85,53 @@ export async function askGeminiRiskAssistant(
     sanitizedHistory.pop();
   }
 
-  const contentsPayload = [
-    ...sanitizedHistory,
-    {
-      role: 'user',
-      parts: [{ text: fullPrompt }],
-    },
-  ];
+  const modelsToTry = ['gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-2.5-flash'];
+  let lastErrorMessage = '';
 
+  // Strategy 1: Official Google GenAI SDK (@google/genai)
+  try {
+    const ai = new GoogleGenAI({ apiKey });
+    for (const modelName of modelsToTry) {
+      try {
+        const response = await ai.models.generateContent({
+          model: modelName,
+          contents: [
+            ...sanitizedHistory.map((h) => ({
+              role: h.role,
+              parts: h.parts.map((p) => ({ text: p.text })),
+            })),
+            {
+              role: 'user',
+              parts: [{ text: fullPrompt }],
+            },
+          ],
+          config: {
+            systemInstruction: SYSTEM_PROMPT,
+            temperature: 0.3,
+          },
+        });
+
+        const outputText = response.text || '';
+        if (outputText) {
+          return { text: outputText, isRealGemini: true };
+        }
+      } catch (err: any) {
+        lastErrorMessage = err?.message || String(err);
+      }
+    }
+  } catch (err: any) {
+    lastErrorMessage = err?.message || String(err);
+  }
+
+  // Strategy 2: Direct REST fetch with Authorization Bearer header for AQ. tokens
   const requestBody = {
-    contents: contentsPayload,
+    contents: [
+      ...sanitizedHistory,
+      {
+        role: 'user',
+        parts: [{ text: fullPrompt }],
+      },
+    ],
     systemInstruction: {
       parts: [{ text: SYSTEM_PROMPT }],
     },
@@ -101,16 +140,16 @@ export async function askGeminiRiskAssistant(
     },
   };
 
-  const modelsToTry = ['gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-2.5-flash'];
-  let lastErrorMessage = '';
-
   for (const modelName of modelsToTry) {
-    // Attempt 1: Standard API key query param
     try {
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${encodeURIComponent(apiKey)}`;
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent`;
       const response = await fetch(url, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${apiKey}`,
+          'x-goog-api-key': apiKey,
+        },
         body: JSON.stringify(requestBody),
       });
 
@@ -118,18 +157,15 @@ export async function askGeminiRiskAssistant(
         const data = await response.json();
         const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
         if (text) return { text, isRealGemini: true };
-      } else {
-        const errorJson = await response.json().catch(() => ({}));
-        lastErrorMessage = errorJson?.error?.message || `HTTP ${response.status} ${response.statusText}`;
       }
     } catch (err: any) {
       lastErrorMessage = err?.message || String(err);
     }
   }
 
-  console.warn('Gemini API call warning:', lastErrorMessage);
+  console.warn('Gemini API call notice:', lastErrorMessage);
 
-  // Return clean educational fallback response if API is unreachable or key invalid
+  // Return clean educational response if API key call fails
   return {
     text: getOfflineFallbackResponse(userQuery, allocation, analytics),
     isRealGemini: false,
