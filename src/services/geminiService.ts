@@ -46,7 +46,7 @@ export function saveGeminiApiKey(key: string): void {
 
 /**
  * Calls Live AI Assistant:
- * 1. NVIDIA NIM API (nvapi-...) - DeepSeek R1 / DeepSeek V3 / Llama 3.3
+ * 1. NVIDIA NIM API (nvapi-...) - DeepSeek R1 / DeepSeek V3 / Llama 3.3 via Proxy
  * 2. Google Gemini API (AIzaSy...)
  * 3. Standard DeepSeek API (sk-...)
  * 4. Free Live AI Endpoint (pollinations.ai)
@@ -75,6 +75,11 @@ export async function askGeminiRiskAssistant(
 
   // STRATEGY 1: NVIDIA NIM API (nvapi-...)
   if (apiKey.startsWith('nvapi-')) {
+    const nvidiaEndpoints = [
+      '/api/nvidia/v1/chat/completions',
+      'https://integrate.api.nvidia.com/v1/chat/completions',
+    ];
+
     const nvidiaModels = [
       'deepseek-ai/deepseek-r1',
       'deepseek-ai/deepseek-v3',
@@ -90,36 +95,35 @@ export async function askGeminiRiskAssistant(
       { role: 'user', content: fullPrompt },
     ];
 
-    for (const modelName of nvidiaModels) {
-      try {
-        const response = await fetch('https://integrate.api.nvidia.com/v1/chat/completions', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${apiKey}`,
-            'Accept': 'application/json',
-          },
-          body: JSON.stringify({
-            model: modelName,
-            messages: nvidiaMessages,
-            temperature: 0.3,
-            max_tokens: 1024,
-          }),
-        });
+    for (const endpoint of nvidiaEndpoints) {
+      for (const modelName of nvidiaModels) {
+        try {
+          const response = await fetch(endpoint, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${apiKey}`,
+              'Accept': 'application/json',
+            },
+            body: JSON.stringify({
+              model: modelName,
+              messages: nvidiaMessages,
+              temperature: 0.3,
+              max_tokens: 1024,
+            }),
+          });
 
-        if (response.ok) {
-          const data = await response.json();
-          let replyText = data?.choices?.[0]?.message?.content;
-          if (replyText) {
-            replyText = replyText.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
-            if (replyText) return { text: replyText, isRealGemini: true };
+          if (response.ok) {
+            const data = await response.json();
+            let replyText = data?.choices?.[0]?.message?.content;
+            if (replyText) {
+              replyText = replyText.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+              if (replyText) return { text: replyText, isRealGemini: true };
+            }
           }
-        } else {
-          const errData = await response.json().catch(() => ({}));
-          console.warn(`NVIDIA NIM Model ${modelName} HTTP Error:`, response.status, errData);
+        } catch (err: any) {
+          console.warn(`NVIDIA NIM Model ${modelName} call failed via ${endpoint}:`, err?.message || err);
         }
-      } catch (err: any) {
-        console.warn(`NVIDIA NIM Model ${modelName} call failed:`, err?.message || err);
       }
     }
   }
@@ -159,34 +163,41 @@ export async function askGeminiRiskAssistant(
 
   // STRATEGY 3: DEEPSEEK API (sk-...)
   if (apiKey.startsWith('sk-')) {
-    try {
-      const response = await fetch('https://api.deepseek.com/chat/completions', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${apiKey}`,
-        },
-        body: JSON.stringify({
-          model: 'deepseek-chat',
-          messages: [
-            { role: 'system', content: SYSTEM_PROMPT },
-            ...conversationHistory.map((h) => ({
-              role: h.role === 'user' ? 'user' : 'assistant',
-              content: h.parts?.[0] || '',
-            })),
-            { role: 'user', content: fullPrompt },
-          ],
-          temperature: 0.3,
-        }),
-      });
+    const deepseekEndpoints = [
+      '/api/deepseek/chat/completions',
+      'https://api.deepseek.com/chat/completions',
+    ];
 
-      if (response.ok) {
-        const data = await response.json();
-        const replyText = data?.choices?.[0]?.message?.content;
-        if (replyText) return { text: replyText, isRealGemini: true };
+    for (const endpoint of deepseekEndpoints) {
+      try {
+        const response = await fetch(endpoint, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${apiKey}`,
+          },
+          body: JSON.stringify({
+            model: 'deepseek-chat',
+            messages: [
+              { role: 'system', content: SYSTEM_PROMPT },
+              ...conversationHistory.map((h) => ({
+                role: h.role === 'user' ? 'user' : 'assistant',
+                content: h.parts?.[0] || '',
+              })),
+              { role: 'user', content: fullPrompt },
+            ],
+            temperature: 0.3,
+          }),
+        });
+
+        if (response.ok) {
+          const data = await response.json();
+          const replyText = data?.choices?.[0]?.message?.content;
+          if (replyText) return { text: replyText, isRealGemini: true };
+        }
+      } catch (e) {
+        // continue
       }
-    } catch (e) {
-      // continue
     }
   }
 
