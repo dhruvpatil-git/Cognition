@@ -5,26 +5,31 @@ import type { Allocation, PortfolioAnalytics } from '../types/risk';
 const API_KEY_STORAGE_KEY = 'investor_risk_gemini_api_key';
 
 /**
- * Retrieves active Gemini API key from localStorage or Vite environment variables.
- * Automatically cleans leading/trailing quotes or whitespace.
+ * Retrieves active DeepSeek or Gemini API key from localStorage or Vite environment variables.
  */
-export function getGeminiApiKey(): string {
+export function getApiKey(): string {
   const localKey = localStorage.getItem(API_KEY_STORAGE_KEY);
   if (localKey && localKey.trim()) {
     return localKey.trim().replace(/^["']|["']$/g, '');
   }
 
-  const envKey = import.meta.env.VITE_GEMINI_API_KEY;
-  if (envKey && envKey.trim()) {
-    return envKey.trim().replace(/^["']|["']$/g, '');
+  const deepseekKey = import.meta.env.VITE_DEEPSEEK_API_KEY;
+  if (deepseekKey && deepseekKey.trim()) {
+    return deepseekKey.trim().replace(/^["']|["']$/g, '');
+  }
+
+  const geminiKey = import.meta.env.VITE_GEMINI_API_KEY;
+  if (geminiKey && geminiKey.trim()) {
+    return geminiKey.trim().replace(/^["']|["']$/g, '');
   }
 
   return '';
 }
 
-/**
- * Saves user-provided Gemini API key to localStorage.
- */
+export function getGeminiApiKey(): string {
+  return getApiKey();
+}
+
 export function saveGeminiApiKey(key: string): void {
   const sanitizedKey = key.trim().replace(/^["']|["']$/g, '');
   if (sanitizedKey) {
@@ -35,8 +40,7 @@ export function saveGeminiApiKey(key: string): void {
 }
 
 /**
- * Calls Google Gemini API using systemPrompt.ts instructions and active portfolio context.
- * Supports all key formats provided by Google Cloud / AI Studio (AIzaSy..., AQ..., etc.).
+ * Calls DeepSeek API (https://api.deepseek.com) with automatic fallback to Gemini API and offline fallback.
  */
 export async function askGeminiRiskAssistant(
   userQuery: string,
@@ -44,9 +48,8 @@ export async function askGeminiRiskAssistant(
   analytics: PortfolioAnalytics,
   conversationHistory: { role: 'user' | 'model'; parts: string[] }[] = []
 ): Promise<{ text: string; isRealGemini: boolean }> {
-  const apiKey = getGeminiApiKey();
+  const apiKey = getApiKey();
 
-  // If no key configured, return educational fallback
   if (!apiKey) {
     return {
       text: getOfflineFallbackResponse(userQuery, allocation, analytics),
@@ -67,28 +70,55 @@ export async function askGeminiRiskAssistant(
 
   const fullPrompt = `${portfolioContext}\n\nUSER QUESTION: ${userQuery}`;
 
-  // Sanitize history so it strictly alternates starting with 'user'
-  const sanitizedHistory: { role: 'user' | 'model'; parts: { text: string }[] }[] = [];
-  let expectedRole: 'user' | 'model' = 'user';
+  // STRATEGY 1: DEEPSEEK API (sk-...)
+  if (apiKey.startsWith('sk-') || import.meta.env.VITE_DEEPSEEK_API_KEY) {
+    const deepseekEndpoints = [
+      'https://api.deepseek.com/chat/completions',
+      'https://api.deepseek.com/v1/chat/completions',
+    ];
 
-  for (const item of conversationHistory) {
-    if (item.role === expectedRole && item.parts?.[0]) {
-      sanitizedHistory.push({
-        role: item.role,
-        parts: [{ text: item.parts[0] }],
-      });
-      expectedRole = expectedRole === 'user' ? 'model' : 'user';
+    const deepseekMessages = [
+      { role: 'system', content: SYSTEM_PROMPT },
+      ...conversationHistory.map((h) => ({
+        role: h.role === 'user' ? 'user' : 'assistant',
+        content: h.parts?.[0] || '',
+      })),
+      { role: 'user', content: fullPrompt },
+    ];
+
+    for (const endpoint of deepseekEndpoints) {
+      try {
+        const response = await fetch(endpoint, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${apiKey}`,
+          },
+          body: JSON.stringify({
+            model: 'deepseek-chat',
+            messages: deepseekMessages,
+            temperature: 0.3,
+            max_tokens: 1500,
+          }),
+        });
+
+        if (response.ok) {
+          const data = await response.json();
+          const replyText = data?.choices?.[0]?.message?.content;
+          if (replyText) {
+            return { text: replyText, isRealGemini: true };
+          }
+        }
+      } catch (err: any) {
+        console.warn('DeepSeek API call failed:', err?.message || err);
+      }
     }
   }
 
-  if (sanitizedHistory.length > 0 && sanitizedHistory[sanitizedHistory.length - 1].role === 'user') {
-    sanitizedHistory.pop();
-  }
-
+  // STRATEGY 2: GOOGLE GEMINI API (@google/genai)
   const modelsToTry = ['gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-2.5-flash'];
   let lastErrorMessage = '';
 
-  // Strategy 1: Official Google GenAI SDK (@google/genai)
   try {
     const ai = new GoogleGenAI({ apiKey });
     for (const modelName of modelsToTry) {
@@ -96,9 +126,9 @@ export async function askGeminiRiskAssistant(
         const response = await ai.models.generateContent({
           model: modelName,
           contents: [
-            ...sanitizedHistory.map((h) => ({
+            ...conversationHistory.map((h) => ({
               role: h.role,
-              parts: h.parts.map((p) => ({ text: p.text })),
+              parts: h.parts.map((p) => ({ text: p })),
             })),
             {
               role: 'user',
@@ -123,34 +153,17 @@ export async function askGeminiRiskAssistant(
     lastErrorMessage = err?.message || String(err);
   }
 
-  // Strategy 2: Direct REST fetch with Authorization Bearer header for AQ. tokens
-  const requestBody = {
-    contents: [
-      ...sanitizedHistory,
-      {
-        role: 'user',
-        parts: [{ text: fullPrompt }],
-      },
-    ],
-    systemInstruction: {
-      parts: [{ text: SYSTEM_PROMPT }],
-    },
-    generationConfig: {
-      temperature: 0.3,
-    },
-  };
-
+  // STRATEGY 3: REST Bearer / Query fallback
   for (const modelName of modelsToTry) {
     try {
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent`;
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${encodeURIComponent(apiKey)}`;
       const response = await fetch(url, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${apiKey}`,
-          'x-goog-api-key': apiKey,
-        },
-        body: JSON.stringify(requestBody),
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ role: 'user', parts: [{ text: fullPrompt }] }],
+          systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
+        }),
       });
 
       if (response.ok) {
@@ -163,9 +176,8 @@ export async function askGeminiRiskAssistant(
     }
   }
 
-  console.warn('Gemini API call notice:', lastErrorMessage);
+  console.warn('AI API call notice:', lastErrorMessage);
 
-  // Return clean educational response if API key call fails
   return {
     text: getOfflineFallbackResponse(userQuery, allocation, analytics),
     isRealGemini: false,
