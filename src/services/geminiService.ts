@@ -8,6 +8,11 @@ const API_KEY_STORAGE_KEY = 'investor_risk_gemini_api_key';
  * Retrieves active API key from Vite environment variables or localStorage.
  */
 export function getApiKey(): string {
+  const nvidiaKey = import.meta.env.VITE_NVIDIA_API_KEY;
+  if (nvidiaKey && nvidiaKey.trim()) {
+    return nvidiaKey.trim().replace(/^["']|["']$/g, '');
+  }
+
   const deepseekKey = import.meta.env.VITE_DEEPSEEK_API_KEY;
   if (deepseekKey && deepseekKey.trim() && !deepseekKey.includes('your_deepseek_api_key_here')) {
     return deepseekKey.trim().replace(/^["']|["']$/g, '');
@@ -41,10 +46,11 @@ export function saveGeminiApiKey(key: string): void {
 
 /**
  * Calls Live AI Assistant:
- * 1. Google Gemini API (if key starts with AIzaSy...)
- * 2. DeepSeek API (if key starts with sk-...)
- * 3. Free Live AI Endpoint (pollinations.ai) - 100% Free, Zero Key / Credit Card required!
- * 4. Offline Risk Engine Fallback
+ * 1. NVIDIA NIM API (nvapi-...) - DeepSeek R1 / DeepSeek V3 / Llama 3.3
+ * 2. Google Gemini API (AIzaSy...)
+ * 3. Standard DeepSeek API (sk-...)
+ * 4. Free Live AI Endpoint (pollinations.ai)
+ * 5. Offline Risk Engine Fallback
  */
 export async function askGeminiRiskAssistant(
   userQuery: string,
@@ -67,7 +73,58 @@ export async function askGeminiRiskAssistant(
 
   const fullPrompt = `${portfolioContext}\n\nUSER QUESTION: ${userQuery}`;
 
-  // STRATEGY 1: GOOGLE GEMINI API (AIzaSy...)
+  // STRATEGY 1: NVIDIA NIM API (nvapi-...)
+  if (apiKey.startsWith('nvapi-')) {
+    const nvidiaModels = [
+      'deepseek-ai/deepseek-r1',
+      'deepseek-ai/deepseek-v3',
+      'meta/llama-3.3-70b-instruct',
+    ];
+
+    const nvidiaMessages = [
+      { role: 'system', content: SYSTEM_PROMPT },
+      ...conversationHistory.map((h) => ({
+        role: h.role === 'user' ? 'user' : 'assistant',
+        content: h.parts?.[0] || '',
+      })),
+      { role: 'user', content: fullPrompt },
+    ];
+
+    for (const modelName of nvidiaModels) {
+      try {
+        const response = await fetch('https://integrate.api.nvidia.com/v1/chat/completions', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${apiKey}`,
+            'Accept': 'application/json',
+          },
+          body: JSON.stringify({
+            model: modelName,
+            messages: nvidiaMessages,
+            temperature: 0.3,
+            max_tokens: 1024,
+          }),
+        });
+
+        if (response.ok) {
+          const data = await response.json();
+          let replyText = data?.choices?.[0]?.message?.content;
+          if (replyText) {
+            replyText = replyText.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+            if (replyText) return { text: replyText, isRealGemini: true };
+          }
+        } else {
+          const errData = await response.json().catch(() => ({}));
+          console.warn(`NVIDIA NIM Model ${modelName} HTTP Error:`, response.status, errData);
+        }
+      } catch (err: any) {
+        console.warn(`NVIDIA NIM Model ${modelName} call failed:`, err?.message || err);
+      }
+    }
+  }
+
+  // STRATEGY 2: GOOGLE GEMINI API (AIzaSy...)
   if (apiKey.startsWith('AIzaSy')) {
     const modelsToTry = ['gemini-2.0-flash', 'gemini-1.5-flash'];
     try {
@@ -100,7 +157,7 @@ export async function askGeminiRiskAssistant(
     }
   }
 
-  // STRATEGY 2: DEEPSEEK API (sk-...)
+  // STRATEGY 3: DEEPSEEK API (sk-...)
   if (apiKey.startsWith('sk-')) {
     try {
       const response = await fetch('https://api.deepseek.com/chat/completions', {
@@ -133,7 +190,7 @@ export async function askGeminiRiskAssistant(
     }
   }
 
-  // STRATEGY 3: 100% FREE LIVE AI PROVIDER (Pollinations AI - Zero Key Required!)
+  // STRATEGY 4: 100% FREE LIVE AI PROVIDER (Pollinations AI)
   try {
     const freeMessages = [
       { role: 'system', content: SYSTEM_PROMPT },
@@ -164,7 +221,7 @@ export async function askGeminiRiskAssistant(
     console.warn('Free Live AI Endpoint Notice:', e);
   }
 
-  // STRATEGY 4: SMART EDUCATIONAL FALLBACK ENGINE
+  // STRATEGY 5: SMART EDUCATIONAL FALLBACK ENGINE
   return {
     text: getOfflineFallbackResponse(userQuery, allocation, analytics),
     isRealGemini: false,
