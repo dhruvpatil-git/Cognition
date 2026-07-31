@@ -45,12 +45,28 @@ export function saveGeminiApiKey(key: string): void {
 }
 
 /**
- * Calls Live AI Assistant:
- * 1. NVIDIA NIM API (nvapi-...) - DeepSeek R1 / DeepSeek V3 / Llama 3.3 via Proxy
- * 2. Google Gemini API (AIzaSy...)
- * 3. Standard DeepSeek API (sk-...)
+ * Helper to execute fetch with a strict timeout (default 3.5s) to prevent hanging.
+ */
+async function fetchWithTimeout(url: string, options: RequestInit, timeoutMs = 3500): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, { ...options, signal: controller.signal });
+    clearTimeout(timer);
+    return response;
+  } catch (err) {
+    clearTimeout(timer);
+    throw err;
+  }
+}
+
+/**
+ * Calls Live AI Assistant with robust, non-blocking fallback architecture:
+ * 1. NVIDIA NIM API (if key starts with nvapi-)
+ * 2. Google Gemini API (if key starts with AIzaSy)
+ * 3. DeepSeek API (if key starts with sk-)
  * 4. Free Live AI Endpoint (pollinations.ai)
- * 5. Offline Risk Engine Fallback
+ * 5. Smart Educational Fallback Engine (Instant 0ms response)
  */
 export async function askGeminiRiskAssistant(
   userQuery: string,
@@ -79,7 +95,6 @@ export async function askGeminiRiskAssistant(
       '/api/nvidia/v1/chat/completions',
       'https://integrate.api.nvidia.com/v1/chat/completions',
     ];
-
     const nvidiaModels = [
       'deepseek-ai/deepseek-r1',
       'deepseek-ai/deepseek-v3',
@@ -98,7 +113,7 @@ export async function askGeminiRiskAssistant(
     for (const endpoint of nvidiaEndpoints) {
       for (const modelName of nvidiaModels) {
         try {
-          const response = await fetch(endpoint, {
+          const response = await fetchWithTimeout(endpoint, {
             method: 'POST',
             headers: {
               'Content-Type': 'application/json',
@@ -111,7 +126,7 @@ export async function askGeminiRiskAssistant(
               temperature: 0.3,
               max_tokens: 1024,
             }),
-          });
+          }, 3000);
 
           if (response.ok) {
             const data = await response.json();
@@ -122,7 +137,7 @@ export async function askGeminiRiskAssistant(
             }
           }
         } catch (err: any) {
-          console.warn(`NVIDIA NIM Model ${modelName} call failed via ${endpoint}:`, err?.message || err);
+          // ignore & try next
         }
       }
     }
@@ -153,11 +168,11 @@ export async function askGeminiRiskAssistant(
           const outputText = response.text || '';
           if (outputText) return { text: outputText, isRealGemini: true };
         } catch (e) {
-          // continue
+          // ignore
         }
       }
     } catch (e) {
-      // continue
+      // ignore
     }
   }
 
@@ -170,7 +185,7 @@ export async function askGeminiRiskAssistant(
 
     for (const endpoint of deepseekEndpoints) {
       try {
-        const response = await fetch(endpoint, {
+        const response = await fetchWithTimeout(endpoint, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -188,7 +203,7 @@ export async function askGeminiRiskAssistant(
             ],
             temperature: 0.3,
           }),
-        });
+        }, 3000);
 
         if (response.ok) {
           const data = await response.json();
@@ -196,12 +211,12 @@ export async function askGeminiRiskAssistant(
           if (replyText) return { text: replyText, isRealGemini: true };
         }
       } catch (e) {
-        // continue
+        // ignore
       }
     }
   }
 
-  // STRATEGY 4: 100% FREE LIVE AI PROVIDER (Pollinations AI)
+  // STRATEGY 4: FREE LIVE AI PROVIDER (Pollinations AI)
   try {
     const freeMessages = [
       { role: 'system', content: SYSTEM_PROMPT },
@@ -212,7 +227,7 @@ export async function askGeminiRiskAssistant(
       { role: 'user', content: fullPrompt },
     ];
 
-    const freeResponse = await fetch('https://text.pollinations.ai/openai', {
+    const freeResponse = await fetchWithTimeout('https://text.pollinations.ai/openai', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -220,7 +235,7 @@ export async function askGeminiRiskAssistant(
         model: 'openai',
         temperature: 0.3,
       }),
-    });
+    }, 2500);
 
     if (freeResponse.ok) {
       const liveText = await freeResponse.text();
@@ -229,10 +244,10 @@ export async function askGeminiRiskAssistant(
       }
     }
   } catch (e) {
-    console.warn('Free Live AI Endpoint Notice:', e);
+    // ignore
   }
 
-  // STRATEGY 5: SMART EDUCATIONAL FALLBACK ENGINE
+  // STRATEGY 5: INSTANT EDUCATIONAL RISK ENGINE FALLBACK (0ms)
   return {
     text: getOfflineFallbackResponse(userQuery, allocation, analytics),
     isRealGemini: false,
