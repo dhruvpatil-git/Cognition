@@ -5,22 +5,22 @@ import type { Allocation, PortfolioAnalytics } from '../types/risk';
 const API_KEY_STORAGE_KEY = 'investor_risk_gemini_api_key';
 
 /**
- * Retrieves active DeepSeek or Gemini API key from localStorage or Vite environment variables.
+ * Retrieves active API key from Vite environment variables or localStorage.
  */
 export function getApiKey(): string {
-  const localKey = localStorage.getItem(API_KEY_STORAGE_KEY);
-  if (localKey && localKey.trim()) {
-    return localKey.trim().replace(/^["']|["']$/g, '');
-  }
-
   const deepseekKey = import.meta.env.VITE_DEEPSEEK_API_KEY;
-  if (deepseekKey && deepseekKey.trim()) {
+  if (deepseekKey && deepseekKey.trim() && !deepseekKey.includes('your_deepseek_api_key_here')) {
     return deepseekKey.trim().replace(/^["']|["']$/g, '');
   }
 
   const geminiKey = import.meta.env.VITE_GEMINI_API_KEY;
-  if (geminiKey && geminiKey.trim()) {
+  if (geminiKey && geminiKey.trim() && !geminiKey.includes('your_gemini_api_key_here')) {
     return geminiKey.trim().replace(/^["']|["']$/g, '');
+  }
+
+  const localKey = localStorage.getItem(API_KEY_STORAGE_KEY);
+  if (localKey && localKey.trim()) {
+    return localKey.trim().replace(/^["']|["']$/g, '');
   }
 
   return '';
@@ -40,7 +40,11 @@ export function saveGeminiApiKey(key: string): void {
 }
 
 /**
- * Calls DeepSeek API (https://api.deepseek.com) with automatic fallback to Gemini API and offline fallback.
+ * Calls Live AI Assistant:
+ * 1. Google Gemini API (if key starts with AIzaSy...)
+ * 2. DeepSeek API (if key starts with sk-...)
+ * 3. Free Live AI Endpoint (pollinations.ai) - 100% Free, Zero Key / Credit Card required!
+ * 4. Offline Risk Engine Fallback
  */
 export async function askGeminiRiskAssistant(
   userQuery: string,
@@ -49,13 +53,6 @@ export async function askGeminiRiskAssistant(
   conversationHistory: { role: 'user' | 'model'; parts: string[] }[] = []
 ): Promise<{ text: string; isRealGemini: boolean }> {
   const apiKey = getApiKey();
-
-  if (!apiKey) {
-    return {
-      text: getOfflineFallbackResponse(userQuery, allocation, analytics),
-      isRealGemini: false,
-    };
-  }
 
   const portfolioContext = `
 [CURRENT PORTFOLIO ALLOCATION SNAPSHOT]
@@ -70,14 +67,75 @@ export async function askGeminiRiskAssistant(
 
   const fullPrompt = `${portfolioContext}\n\nUSER QUESTION: ${userQuery}`;
 
-  // STRATEGY 1: DEEPSEEK API (sk-...)
-  if (apiKey.startsWith('sk-') || import.meta.env.VITE_DEEPSEEK_API_KEY) {
-    const deepseekEndpoints = [
-      'https://api.deepseek.com/chat/completions',
-      'https://api.deepseek.com/v1/chat/completions',
-    ];
+  // STRATEGY 1: GOOGLE GEMINI API (AIzaSy...)
+  if (apiKey.startsWith('AIzaSy')) {
+    const modelsToTry = ['gemini-2.0-flash', 'gemini-1.5-flash'];
+    try {
+      const ai = new GoogleGenAI({ apiKey });
+      for (const modelName of modelsToTry) {
+        try {
+          const response = await ai.models.generateContent({
+            model: modelName,
+            contents: [
+              ...conversationHistory.map((h) => ({
+                role: h.role,
+                parts: h.parts.map((p) => ({ text: p })),
+              })),
+              { role: 'user', parts: [{ text: fullPrompt }] },
+            ],
+            config: {
+              systemInstruction: SYSTEM_PROMPT,
+              temperature: 0.3,
+            },
+          });
 
-    const deepseekMessages = [
+          const outputText = response.text || '';
+          if (outputText) return { text: outputText, isRealGemini: true };
+        } catch (e) {
+          // continue
+        }
+      }
+    } catch (e) {
+      // continue
+    }
+  }
+
+  // STRATEGY 2: DEEPSEEK API (sk-...)
+  if (apiKey.startsWith('sk-')) {
+    try {
+      const response = await fetch('https://api.deepseek.com/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify({
+          model: 'deepseek-chat',
+          messages: [
+            { role: 'system', content: SYSTEM_PROMPT },
+            ...conversationHistory.map((h) => ({
+              role: h.role === 'user' ? 'user' : 'assistant',
+              content: h.parts?.[0] || '',
+            })),
+            { role: 'user', content: fullPrompt },
+          ],
+          temperature: 0.3,
+        }),
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        const replyText = data?.choices?.[0]?.message?.content;
+        if (replyText) return { text: replyText, isRealGemini: true };
+      }
+    } catch (e) {
+      // continue
+    }
+  }
+
+  // STRATEGY 3: 100% FREE LIVE AI PROVIDER (Pollinations AI - Zero Key Required!)
+  try {
+    const freeMessages = [
       { role: 'system', content: SYSTEM_PROMPT },
       ...conversationHistory.map((h) => ({
         role: h.role === 'user' ? 'user' : 'assistant',
@@ -86,98 +144,27 @@ export async function askGeminiRiskAssistant(
       { role: 'user', content: fullPrompt },
     ];
 
-    for (const endpoint of deepseekEndpoints) {
-      try {
-        const response = await fetch(endpoint, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${apiKey}`,
-          },
-          body: JSON.stringify({
-            model: 'deepseek-chat',
-            messages: deepseekMessages,
-            temperature: 0.3,
-            max_tokens: 1500,
-          }),
-        });
+    const freeResponse = await fetch('https://text.pollinations.ai/openai', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        messages: freeMessages,
+        model: 'openai',
+        temperature: 0.3,
+      }),
+    });
 
-        if (response.ok) {
-          const data = await response.json();
-          const replyText = data?.choices?.[0]?.message?.content;
-          if (replyText) {
-            return { text: replyText, isRealGemini: true };
-          }
-        }
-      } catch (err: any) {
-        console.warn('DeepSeek API call failed:', err?.message || err);
+    if (freeResponse.ok) {
+      const liveText = await freeResponse.text();
+      if (liveText && liveText.trim() && !liveText.includes('Internal Server Error')) {
+        return { text: liveText.trim(), isRealGemini: true };
       }
     }
+  } catch (e) {
+    console.warn('Free Live AI Endpoint Notice:', e);
   }
 
-  // STRATEGY 2: GOOGLE GEMINI API (@google/genai)
-  const modelsToTry = ['gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-2.5-flash'];
-  let lastErrorMessage = '';
-
-  try {
-    const ai = new GoogleGenAI({ apiKey });
-    for (const modelName of modelsToTry) {
-      try {
-        const response = await ai.models.generateContent({
-          model: modelName,
-          contents: [
-            ...conversationHistory.map((h) => ({
-              role: h.role,
-              parts: h.parts.map((p) => ({ text: p })),
-            })),
-            {
-              role: 'user',
-              parts: [{ text: fullPrompt }],
-            },
-          ],
-          config: {
-            systemInstruction: SYSTEM_PROMPT,
-            temperature: 0.3,
-          },
-        });
-
-        const outputText = response.text || '';
-        if (outputText) {
-          return { text: outputText, isRealGemini: true };
-        }
-      } catch (err: any) {
-        lastErrorMessage = err?.message || String(err);
-      }
-    }
-  } catch (err: any) {
-    lastErrorMessage = err?.message || String(err);
-  }
-
-  // STRATEGY 3: REST Bearer / Query fallback
-  for (const modelName of modelsToTry) {
-    try {
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${encodeURIComponent(apiKey)}`;
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents: [{ role: 'user', parts: [{ text: fullPrompt }] }],
-          systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
-        }),
-      });
-
-      if (response.ok) {
-        const data = await response.json();
-        const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-        if (text) return { text, isRealGemini: true };
-      }
-    } catch (err: any) {
-      lastErrorMessage = err?.message || String(err);
-    }
-  }
-
-  console.warn('AI API call notice:', lastErrorMessage);
-
+  // STRATEGY 4: SMART EDUCATIONAL FALLBACK ENGINE
   return {
     text: getOfflineFallbackResponse(userQuery, allocation, analytics),
     isRealGemini: false,
